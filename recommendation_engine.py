@@ -21,12 +21,37 @@ class RecommendationEngine:
         "scary": {"ужасы", "триллер", "детектив"},
         "funny": {"комедия", "приключения"},
         "romantic": {"мелодрама", "драма"},
-        "melancholic": {"драма", "фэнтези"},
+        "melancholic": {"драма", "мелодрама"},
         "dynamic": {"боевик", "приключения", "фантастика"},
         "tense": {"триллер", "криминал", "детектив"},
         "evening": {"комедия", "драма", "приключения"},
-        "warm": {"мелодрама", "комедия", "мультфильм"},
+        "warm": {"мелодрама", "комедия", "мультфильм", "семейный"},
         "easy": {"комедия", "приключения", "мультфильм"},
+    }
+    mood_text_hints = {
+        "melancholic": {
+            "потер",
+            "утрат",
+            "разлук",
+            "разбит",
+            "смерт",
+            "траг",
+            "одиноч",
+            "слез",
+            "боль",
+            "печал",
+            "тоск",
+            "горе",
+            "вдов",
+            "ревност",
+            "сердц",
+            "heartbreak",
+            "loss",
+            "grief",
+            "lonel",
+            "tragic",
+            "death",
+        },
     }
 
     def _movie_query(self, db: Session):
@@ -140,6 +165,41 @@ class RecommendationEngine:
             unique_parts.append("хорошо сочетает рейтинг, популярность и тематическое сходство")
         return "; ".join(unique_parts[:3])
 
+    def _mood_target_genres(self, moods: list[str]) -> set[str]:
+        target_genres: set[str] = set()
+        for mood in moods:
+            target_genres.update(self.mood_to_genres.get(mood, set()))
+        return target_genres
+
+    def _movie_text_blob(self, movie: Movie, *, include_keywords: bool = True) -> str:
+        parts = [
+            movie.title or "",
+            movie.original_title or "",
+            movie.overview or "",
+        ]
+        if include_keywords:
+            parts.append(" ".join(keyword.name for keyword in movie.keywords))
+        return " ".join(parts).lower()
+
+    def _mood_text_matches(self, movie: Movie, moods: list[str]) -> list[str]:
+        text_blob = self._movie_text_blob(movie, include_keywords=False)
+        matches: list[str] = []
+        for mood in moods:
+            for fragment in self.mood_text_hints.get(mood, set()):
+                if fragment in text_blob:
+                    matches.append(fragment)
+        return sorted(set(matches))
+
+    def _should_use_mood_as_primary_filter(self, preferences: ParsedPreferences) -> bool:
+        return bool(
+            preferences.moods
+            and not preferences.genres
+            and not preferences.actors
+            and not preferences.directors
+            and preferences.reference_movie_id is None
+            and not preferences.hard_keywords
+        )
+
     def _passes_hard_filters(
         self,
         movie: Movie,
@@ -164,6 +224,26 @@ class RecommendationEngine:
             director_names = {director.name.lower() for director in movie.directors}
             if not any(name.lower() in director_names for name in preferences.directors):
                 return False
+
+        if self._should_use_mood_as_primary_filter(preferences):
+            mood_genres = {genre.lower() for genre in self._mood_target_genres(preferences.moods)}
+            movie_genres = {genre.name.lower() for genre in movie.genres}
+            if mood_genres and not (movie_genres & mood_genres):
+                return False
+            mood_text_matches = self._mood_text_matches(movie, preferences.moods)
+            if "melancholic" in preferences.moods:
+                if "мелодрама" in movie_genres:
+                    pass
+                elif movie_genres <= {"драма"}:
+                    pass
+                elif not mood_text_matches:
+                    return False
+
+        if preferences.hard_keywords:
+            keyword_names = {keyword.name.lower() for keyword in movie.keywords}
+            combined_text = self._movie_text_blob(movie)
+            if not any(keyword.lower() in combined_text or keyword.lower() in keyword_names for keyword in preferences.hard_keywords):
+                return False
         return True
 
     def _preference_score(
@@ -179,14 +259,7 @@ class RecommendationEngine:
         actor_names = {actor.name for actor in movie.actors}
         director_names = {director.name for director in movie.directors}
         keyword_names = {keyword.name.lower() for keyword in movie.keywords}
-        combined_text = " ".join(
-            [
-                movie.title or "",
-                movie.original_title or "",
-                movie.overview or "",
-                " ".join(keyword.name for keyword in movie.keywords),
-            ],
-        ).lower()
+        combined_text = self._movie_text_blob(movie)
 
         matched_genres = sorted(set(preferences.genres) & genre_names)
         if matched_genres:
@@ -203,9 +276,10 @@ class RecommendationEngine:
             score += 0.20
             reasons.append(f"совпадает по режиссеру: {', '.join(matched_directors[:2])}")
 
+        effective_keywords = list(dict.fromkeys([*preferences.keywords, *preferences.hard_keywords]))
         matched_keywords = [
             keyword
-            for keyword in preferences.keywords
+            for keyword in effective_keywords
             if keyword.lower() in combined_text or keyword.lower() in keyword_names
         ]
         if matched_keywords:
@@ -213,11 +287,16 @@ class RecommendationEngine:
             reasons.append(f"есть нужная тематика: {', '.join(matched_keywords[:3])}")
 
         mood_bonus = 0.0
-        for mood in preferences.moods:
-            if genre_names & self.mood_to_genres.get(mood, set()):
-                mood_bonus += 0.05
+        mood_genres = self._mood_target_genres(preferences.moods)
+        matched_mood_genres = sorted(genre_names & mood_genres)
+        mood_text_matches = self._mood_text_matches(movie, preferences.moods)
+        if matched_mood_genres:
+            overlap_ratio = len(matched_mood_genres) / max(1, len(mood_genres))
+            mood_bonus = 0.12 + 0.12 * overlap_ratio
+        if mood_text_matches:
+            mood_bonus += 0.10
         if mood_bonus:
-            score += min(0.15, mood_bonus)
+            score += min(0.24, mood_bonus)
             reasons.append("совпадает по настроению запроса")
 
         if reference_movie is not None:
@@ -508,6 +587,9 @@ class RecommendationEngine:
             personal_probability = personalization.probabilities.get(movie.id, 0.0)
             quality = min(self._to_float(movie.rating) / 10.0, 1.0)
             popularity = min(self._to_float(movie.popularity) / max_popularity, 1.0)
+            mood_first_query = self._should_use_mood_as_primary_filter(preferences)
+            effective_user_affinity = user_affinity * (0.35 if mood_first_query else 1.0)
+            effective_personal_probability = personal_probability * (0.35 if mood_first_query else 1.0)
 
             if personalization.probabilities:
                 final_score = (
@@ -515,8 +597,8 @@ class RecommendationEngine:
                     + 0.21 * preference_score
                     + 0.12 * quality
                     + 0.08 * popularity
-                    + 0.10 * user_affinity
-                    + 0.17 * personal_probability
+                    + 0.10 * effective_user_affinity
+                    + 0.17 * effective_personal_probability
                 )
             elif semantic_scores or preference_score or user_affinity:
                 final_score = (
@@ -524,7 +606,7 @@ class RecommendationEngine:
                     + 0.25 * preference_score
                     + 0.15 * quality
                     + 0.10 * popularity
-                    + 0.05 * user_affinity
+                    + 0.05 * effective_user_affinity
                 )
             else:
                 final_score = 0.6 * quality + 0.4 * popularity

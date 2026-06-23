@@ -15,6 +15,7 @@ class ParsedPreferences:
     directors: list[str] = field(default_factory=list)
     moods: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
+    hard_keywords: list[str] = field(default_factory=list)
     reference_movie: str | None = None
     reference_movie_id: int | None = None
     free_text: str | None = None
@@ -41,7 +42,11 @@ class NLPParser:
         "смеш": "funny",
         "весел": "funny",
         "романт": "romantic",
-        "добрый": "warm",
+        "добр": "warm",
+        "хорош": "warm",
+        "уют": "warm",
+        "светл": "warm",
+        "позитив": "easy",
         "легк": "easy",
         "вечер": "evening",
         "напряж": "tense",
@@ -61,6 +66,13 @@ class NLPParser:
         "кримин": "криминал",
         "фэнтез": "фэнтези",
         "мульт": "мультфильм",
+    }
+
+    franchise_aliases = {
+        "dc": ["dc universe"],
+        "dcu": ["dc universe"],
+        "marvel": ["marvel cinematic universe"],
+        "mcu": ["marvel cinematic universe"],
     }
 
     stopwords = {
@@ -83,6 +95,9 @@ class NLPParser:
         "похожий",
         "вечером",
         "вечер",
+        "кино",
+        "фильмы",
+        "фильмец",
     }
 
     def normalize(self, text: str) -> str:
@@ -102,6 +117,7 @@ class NLPParser:
             preferences.reference_movie = reference_movie.title
             preferences.reference_movie_id = reference_movie.id
 
+        preferences.hard_keywords = self._match_franchise_aliases(normalized)
         preferences.keywords = self._extract_keywords(normalized, preferences)
         return preferences
 
@@ -164,6 +180,13 @@ class NLPParser:
             if original_title and original_title in normalized_message:
                 return movie
         return None
+
+    def _match_franchise_aliases(self, normalized: str) -> list[str]:
+        matches = []
+        for alias, canonical_keywords in self.franchise_aliases.items():
+            if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", normalized):
+                matches.extend(canonical_keywords)
+        return sorted(set(matches))
 
     def _extract_keywords(self, normalized: str, preferences: ParsedPreferences) -> list[str]:
         occupied = {
